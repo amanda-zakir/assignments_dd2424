@@ -1,6 +1,6 @@
 import numpy as np
 
-debug_file = 'debug_info.npz'
+debug_file = 'assignment_3/debug_info.npz'
 load_data = np.load(debug_file)
 X = load_data['X']
 Fs = load_data['Fs']
@@ -134,6 +134,7 @@ def BackwardPass(net_params, fp_data, Y, lam):
     grad_b1 = np.sum(G_relu, axis=1, keepdims=True)
     
     G_batch = net_params['W'][0].T @ G_relu
+    G_batch = G_batch * (fp_data['conv_flat'] > 0)
     GG = G_batch.reshape((n_p, nf, n), order='C')
     
     MXt = np.transpose(MX, (1, 0, 2))
@@ -212,5 +213,5 @@ if np.max(rel_error) < 1e-7:
 else:
     print("❌ Mismatch detected. Check your einsum or your 1/n scaling.")
 
-print("First 5 Analytical:", grad_Fs_flat.flatten()[:5])
-print("First 5 Target:    ", load_data['grad_Fs_flat'].flatten()[:5])
+print("First 5 Analytical:", grad_Fs_flat - load_data['grad_Fs_flat'])
+print("First 5 Target:    ")
