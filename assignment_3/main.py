@@ -4,7 +4,7 @@ import numpy as np
 import pickle
 import copy
 import warnings
-#from torch_gradient_computations import *
+from torch_gradient_computations import *
 
 def LoadBatch(filename):
     # Load a batch of training data
@@ -24,8 +24,8 @@ def LoadBatch(filename):
     return X, Y, y
 
 def NormalizeData(X):
-    mean_X =  np.mean(X, axis=1).reshape(X.shape[0], 1)
-    std_X =  np.std(X, axis=1).reshape(X.shape[0], 1)
+    mean_X =  np.mean(X, axis=1)
+    std_X =  np.std(X, axis=1)
     return mean_X, std_X
 
 def Convolution(X, Fs):
@@ -42,9 +42,11 @@ def Convolution(X, Fs):
     return output
 
 def MXConvolution(X, Fs):
+    """
     f = Fs.shape[0]
     n_p = (X.shape[0]//f) * (X.shape[1]//f)
     n = X.shape[3]
+    print("n_p:", n_p)
     MX = np.zeros((n_p, f*f*3, n), dtype=np.float32)
     X_patch = np.zeros((f, f, 3), dtype=np.float32)
 
@@ -56,35 +58,67 @@ def MXConvolution(X, Fs):
                     MX[count, :, i] = X_patch.reshape((1, f*f*3), order='C')
                     count += 1
     return MX
+    """
+    # X shape: (Height, Width, Channels, Num_Images)
+    # Ensure X is float32 as requested
+    X = X.astype(np.float32)
+    
+    f = Fs.shape[0]
+    h, w, c, n = X.shape
+    
+    # Calculate n_p based on stride f
+    n_p_h = h // f
+    n_p_w = w // f
+    n_p = n_p_h * n_p_w
+    
+    # Debug print to catch which dimension is failing
+    if n_p != 64:
+        print(f"WARNING: Unexpected n_p: {n_p} (Image size: {h}x{w})")
+    
+    MX = np.zeros((n_p, f * f * c, n), dtype=np.float32)
 
-def InitializeParameters(L, m, rng):
+    for i in range(n):
+        count = 0
+        for k in range(n_p_h):
+            for l in range(n_p_w):
+                # Extract the patch
+                X_patch = X[k*f : (k+1)*f, l*f : (l+1)*f, :, i]
+                # order='C' is standard, just ensure filters match it
+                MX[count, :, i] = X_patch.reshape(f * f * c, order='C')
+                count += 1
+    return MX
+
+def InitializeParameters(L, m, K, d, nf, f, rng):
     """
     L: Number of layers
     K: Number of classes
     d: Number of neurons in hidden layer
-    m: Number of input features
+    m: Number of hidden neurons
     """
     net_params = {}
     net_params['Fs'] = [None]
     net_params['W'] = [None] * L
     net_params['b'] = [None] * L
     net_params['Fs'] = rng.normal(0, 1/np.sqrt(3*f*f), (f, f, 3, nf))
-    net_params['bf'] = np.zeros((nf, 1))
+    #net_params['bf'] = np.zeros((nf, 1))
 
     for i in range(L):
         if i == 0:
-            net_params['W'][i] = np.sqrt(2/m)*rng.standard_normal(size=(m, d)).astype(np.float32)
-            net_params['b'][i] = np.zeros((d, 1)).astype(np.float32)
+            net_params['W'][i] = (np.sqrt(2/d) * rng.standard_normal(size=(m, d))).astype(np.float32)
+            net_params['b'][i] = np.zeros((m, 1)).astype(np.float32)
         else:
-            net_params['W'][i] = np.sqrt(2/d)*rng.standard_normal(size=(K, d)).astype(np.float32)
+            net_params['W'][i] = (np.sqrt(2/m) * rng.standard_normal(size=(K, m))).astype(np.float32)
             net_params['b'][i] = np.zeros((K, 1)).astype(np.float32)
     return net_params
 
 
 def ForwardPass(MX, Fs, net_params):
     n_p = MX.shape[0]   
+    nf = Fs.shape[3]
+    n = MX.shape[2]
     h_conv = np.zeros((n_p, nf, n), dtype=np.float32)
     nf= Fs.shape[3]
+    Fs_flat = Fs.reshape((f*f*3, nf), order='C')
     
     fp_data = {}
     fp_data['conv_flat'] = [None]
@@ -138,7 +172,12 @@ def BackwardPass(MX, net_params, fp_data, Y, lam):
     
     grad_Fs_flat = np.einsum('ijn, jln -> il', MXt, GG, optimize=True) 
 
-    return grad_W1, grad_b1, grad_W2, grad_b2, grad_Fs_flat
+    grads = {
+    'W': [grad_W1, grad_W2],
+    'b': [grad_b1, grad_b2],
+    'Fs_flat': grad_Fs_flat
+    }
+    return grads
 
 def DataSplit(X, Y, y, sample_size):
     X_all = []
@@ -155,22 +194,17 @@ def DataSplit(X, Y, y, sample_size):
     Y_all = np.concatenate(Y_all, axis=1)
     y_all = np.concatenate(y_all, axis=0)
 
-    TrainX = X_all[:, :sample_size]
+    TrainX = X_all[:, :, :, :sample_size]
     TrainY = Y_all[:, :sample_size]
     Trainy = y_all[:sample_size]
 
-    ValX = X_all[:, sample_size:]
+    ValX = X_all[:, :, :, sample_size:]
     ValY = Y_all[:, sample_size:]
     Valy = y_all[sample_size:]
 
     TestX, TestY, Testy = LoadBatch('test_batch')
-    
-    mean_X, std_X = NormalizeData(TrainX)
-    TrainX = (TrainX - mean_X) / std_X
-    ValX = (ValX - mean_X) / std_X
-    TestX = (TestX - mean_X) / std_X
 
-    return TestX, TrainX, TrainY, Trainy, TestY, Testy, ValY, Valy
+    return TestX, TestY, Testy, TrainX, TrainY, Trainy, ValX, ValY, Valy
 
 def PreComputeMX(TrainX, TestX, ValX, Fs):
     MX_TrainX = MXConvolution(TrainX, Fs)
@@ -204,27 +238,46 @@ def TrainNetwork(MX_Train, TrainY, init_net, net_params):
             for l in range(len(trained_net['W'])):
                 trained_net['W'][l] -= eta * grads['W'][l]
                 trained_net['b'][l] -= eta * grads['b'][l]
-            trained_net['Fs'] -= eta * grads['Fs']
+            trained_net['Fs'] -= eta * grads['Fs_flat']
 
 data = LoadBatch('data_batch_1')
 X, Y, y = data
-
-net_params= InitializeParameters(2, 10, np.random.default_rng(seed=0))
-W = net_params['W']
-b = net_params['b']
-Fs = net_params['Fs']   
-
-f = Fs.shape[0]
-nf = Fs.shape[3]
-n = X.shape[1]
-X_ims = X.reshape((32, 32, 3, n), order='C')        
-n_p = (X_ims.shape[0]//f) * (X_ims.shape[1]//f)
+f = 4
+nf = 3
+n = X.shape[3] 
+n_p = (X.shape[0]//f) * (X.shape[1]//f)
 d = n_p * nf
 K = Y.shape[0]
 L = 2
 
-TestX, TrainX, TrainY, Trainy, TestX, TestY, Testy, ValX, ValY, Valy = DataSplit(X, Y, y, sample_size=1)
+net_params= InitializeParameters(L, 10, K, d, nf, f, np.random.default_rng(seed=0))
+W = net_params['W']
+b = net_params['b']
+Fs = net_params['Fs']   
+
+
+
+
+TestX, TestY, Testy, TrainX, TrainY, Trainy, ValX, ValY, Valy = DataSplit(X, Y, y, sample_size=1)
 MX_TrainX, MX_TestX, MX_ValX = PreComputeMX(TrainX, TestX, ValX, Fs)
+
+torch_grads = ComputeGradsWithTorch(TrainX, Trainy, MX_TrainX, Fs, net_params)
+my_grads = BackwardPass(MX_TrainX, net_params, ForwardPass(MX_TrainX, Fs, net_params), TrainY, lam=0.0)
+
+eps = 1e-10
+
+diff_W1 = np.abs(my_grads['W'][0] - torch_grads['W'][0]) / max(eps, np.sum(np.sum(np.abs(my_grads['W'][0]) + np.abs(torch_grads['W'][0]), axis=0), axis=0))
+diff_b1 = np.abs(my_grads['b'][0] - torch_grads['b'][0])/ max(eps, np.sum(np.abs(my_grads['b'][0]) + np.abs(torch_grads['b'][0])))
+diff_Fs = np.abs(my_grads['Fs_flat'] - torch_grads['Fs_flat']) / max(eps, np.sum(np.abs(my_grads['Fs_flat']) + np.abs(torch_grads['Fs_flat'])))
+
+diff_W2 = np.abs(my_grads['W'][1] - torch_grads['W'][1]) / max(eps, np.sum(np.sum(np.abs(my_grads['W'][1]) + np.abs(torch_grads['W'][1]), axis=0), axis=0)) 
+diff_b2 = np.abs(my_grads['b'][1] - torch_grads['b'][1])/ max(eps, np.sum(np.abs(my_grads['b'][1]) + np.abs(torch_grads['b'][1])))
+
+print("Relative difference in W1: ", diff_W1)
+print("Relative difference in b1: ", diff_b1)
+print("Relative difference in Fs: ", diff_Fs)
+print("Relative difference in W2: ", diff_W2)
+print("Relative difference in b2: ", diff_b2)
 
 """
 MX_TrainX, MX_TestX = PreComputeMX(TrainX, TestX)
