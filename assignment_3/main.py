@@ -19,7 +19,6 @@ def LoadBatch(filename):
     y = np.array(Y)
     Y = np.eye(np.unique(y).shape[0])[Y].astype(np.float32)
 
-    X = X.reshape(-1, 3, 32, 32).transpose(2, 3, 1, 0)
     
     return X.T, Y.T, y
 
@@ -42,71 +41,23 @@ def Convolution(X, Fs):
     return output
 
 def MXConvolution(X, Fs):
-    """
     f = Fs.shape[0]
-    n_p = (X.shape[0]//f) * (X.shape[1]//f)
-    n = X.shape[3]
+    n_p = (X.shape[2]//f) * (X.shape[3]//f)
+    n = X.shape[0]
+    print(n)
     print("n_p:", n_p)
     MX = np.zeros((n_p, f*f*3, n), dtype=np.float32)
     X_patch = np.zeros((f, f, 3), dtype=np.float32)
 
     for i in range(n):
             count = 0
-            for k in range(X.shape[0]//f):
-                for l in range(X.shape[1]//f):
-                    X_patch = X[k*f: (k+1)*f, l*f:(l+1)*f, :, i]
+            for k in range(X.shape[2]//f):
+                for l in range(X.shape[3]//f):
+                    X_patch = X[i, :, k*f: (k+1)*f, l*f:(l+1)*f]
                     MX[count, :, i] = X_patch.reshape((1, f*f*3), order='C')
                     count += 1
     return MX
-    """
-    """
-    # X shape: (Height, Width, Channels, Num_Images)
-    # Ensure X is float32 as requested
-    X = X.astype(np.float32)
-    
-    f = Fs.shape[0]
-    n, c, h, w = X.shape
-    
-    # Calculate n_p based on stride f
-    n_p_h = h // f
-    n_p_w = w // f
-    n_p = n_p_h * n_p_w
-    
-    # Debug print to catch which dimension is failing
-    if n_p != 64:
-        print(f"WARNING: Unexpected n_p: {n_p} (Image size: {h}x{w})")
-    
-    MX = np.zeros((n_p, f * f * c, n), dtype=np.float32)
 
-    for i in range(n):
-        count = 0
-        for k in range(n_p_h):
-            for l in range(n_p_w):
-                # Extract the patch
-                X_patch = X[i, :, k*f:(k+1)*f, l*f:(l+1)*f]
-                # order='C' is standard, just ensure filters match it
-                MX[count, :, i] = X_patch.reshape(f * f * c, order='C')
-                count += 1
-    return MX
-    """
-    # X shape from LoadBatch is (N, C, W, H) due to .T on (H,W,C,N)
-    N, C, H, W = X.shape          # was wrongly named n,c,h,w
-    f = Fs.shape[0]
-
-    n_p_h = H // f
-    n_p_w = W // f
-    n_p = n_p_h * n_p_w
-
-    MX = np.zeros((n_p, f * f * C, N), dtype=np.float32)
-
-    for i in range(N):
-        count = 0
-        for k in range(n_p_h):
-            for l in range(n_p_w):
-                X_patch = X[i, :, k*f:(k+1)*f, l*f:(l+1)*f]  # shape: (C, f, f)
-                MX[count, :, i] = X_patch.reshape(f * f * C, order='C')
-                count += 1
-    return MX
 def InitializeParameters(L, m, K, d, nf, f, rng):
     """
     L: Number of layers
@@ -132,42 +83,47 @@ def InitializeParameters(L, m, K, d, nf, f, rng):
 
 
 def ForwardPass(MX, Fs, net_params):
-    n_p = MX.shape[0]   
-    nf = Fs.shape[3]
-    n = MX.shape[2]
+    print("MX shape:", MX.shape)
+    n_p = MX.shape[0]          # number of patches
+    n = MX.shape[2]            # batch size
+    nf = Fs.shape[3]           # number of filters
+    f = Fs.shape[0]
+    c = Fs.shape[2]
+
+    # ---- Flatten filters ----
+    Fs_flat = Fs.transpose(2, 0, 1, 3).reshape((c * f * f, nf), order='C')
+
+    # ---- Convolution ----
     h_conv = np.zeros((n_p, nf, n), dtype=np.float32)
-    nf= Fs.shape[3]
-    Fs_flat = Fs.transpose(2, 0, 1, 3).reshape((3*f*f, nf), order='C')
-    
-    fp_data = {}
-    fp_data['conv_flat'] = [None]
-    fp_data['X1'] = [None]
-    fp_data['P'] = [None]
-    
     for i in range(n):
-        h_conv[:,:, i] = np.matmul(MX[:,:, i], Fs_flat) 
+        h_conv[:, :, i] = MX[:, :, i] @ Fs_flat
 
+    # ---- ReLU ----
     h_conv_relu = np.maximum(0, h_conv)
-    h_conv_permuted = np.transpose(h_conv_relu, (1, 0, 2)) # Move nf to the front
-    h_flat = h_conv_permuted.reshape(nf * n_p, n, order='C')
-    z_1 = np.matmul(net_params['W'][0], h_flat) + net_params['b'][0]
-    x_1 = np.maximum(np.zeros(np.shape(z_1)), z_1)
-    s = np.matmul(net_params['W'][1], x_1) + net_params['b'][1]
-    print("s sum:", np.sum(s))
 
+    # ---- Flatten: (n_p, nf, n) → (nf, n_p, n) → (nf*n_p, n) ----
+    h_conv_perm = np.transpose(h_conv_relu, (1, 0, 2))
+    conv_flat = h_conv_perm.reshape(nf * n_p, n, order='C')
+
+    # ---- First FC ----
+    z1 = net_params['W'][0] @ conv_flat + net_params['b'][0]
+    X1 = np.maximum(0, z1)
+
+    # ---- Second FC ----
+    s = net_params['W'][1] @ X1 + net_params['b'][1]
+
+    # ---- Softmax ----
     s_max = np.max(s, axis=0, keepdims=True)
     exp_s = np.exp(s - s_max)
     P = exp_s / np.sum(exp_s, axis=0, keepdims=True)
 
-    #P = np.exp(s) / np.sum(np.exp(s), axis=0)
-    
-    fp_data['conv_flat'] = h_flat
-    fp_data['X1'] = x_1
-    fp_data['P'] = P
+    # ---- Only required outputs ----
+    load_data = {}
+    load_data['conv_flat'] = conv_flat   # (n_p * nf, n)
+    load_data['X1'] = X1                 # (nh, n)
+    load_data['P'] = P                   # (10, n)
 
-    print("X1 sum: ", np.sum(x_1))
-
-    return fp_data
+    return load_data
 
 def ComputeCrossEntropyLoss(P, Y):
     nn = P.shape[1]
@@ -177,8 +133,24 @@ def ComputeCrossEntropyLoss(P, Y):
     loss = -np.mean(np.log(correct_class_probs))
     return loss
 
+def ComputeCost(P, y, network, lam):
+    loss = ComputeCrossEntropyLoss(P, y)
+    W = network['W']
+    reg_term = lam * (np.sum(W[0]**2) + np.sum(W[1]**2))
+    return loss + reg_term
+
+def ComputeAccuracy(P, y):
+    acc = 0
+    predicted_classes = np.argmax(P, axis=0)
+    real_classes = y
+    acc = np.mean(predicted_classes == real_classes) * 100
+    return str(acc) + " %"
+
 def BackwardPass(MX, Y, net_params, fp_data, lam):
+    """
     n = Y.shape[1]
+    n_p = MX.shape[0]
+    nf = net_params['Fs'].shape[3]
     P = fp_data['P'].copy()
     print("MX shape:", MX.shape)
     
@@ -194,18 +166,21 @@ def BackwardPass(MX, Y, net_params, fp_data, lam):
     grad_b1 = np.sum(G_relu, axis=1, keepdims=True) 
     
     G_batch = net_params['W'][0].T @ G_relu
-    G_batch = G_batch * (fp_data['conv_flat'] > 0)
-    print("G_batch shape:", G_batch.shape)
-   
-    GG = G_batch.reshape((n_p, nf, n), order='C') 
+    G_batch = G_batch * (fp_data['conv_flat'].reshape(n_p * nf, n, order='C') > 0)
 
-    #GG = GG.transpose(1, 0, 2) 
+    n_p, _, _ = MX.shape 
+    nf = net_params['Fs'].shape[3] 
+    print("conv_flat shape:", fp_data['conv_flat'].shape)
+    print("expected:", n_p * nf, n) 
+    GG = G_batch.reshape((nf, n_p, n), order='C') 
+
+    GG = GG.transpose(1, 0, 2) 
     print("GG shape:", GG.shape)
     
-    #MXt = np.transpose(MX, (1, 0, 2))
+    MXt = np.transpose(MX, (1, 0, 2))
     #print("MXt shape:", MXt.shape)
     
-    grad_Fs_flat =  np.einsum('jin, jln -> il', MX, GG) 
+    grad_Fs_flat =  np.einsum('ijn, jln -> il', MXt, GG) 
     
     grads = {
         'W': [grad_W1, grad_W2],
@@ -213,11 +188,68 @@ def BackwardPass(MX, Y, net_params, fp_data, lam):
         'Fs_flat': grad_Fs_flat
     }
 
+    print("Fs_flat shape:", grad_Fs_flat.shape)
+
     loss = ComputeCrossEntropyLoss(P, Y)
     print("Loss analytical:", loss)
 
     return grads
+    """
+    n = Y.shape[1]
+    n_p = MX.shape[0]
+    nf = net_params['Fs'].shape[3]
 
+    P = fp_data['P']
+    X1 = fp_data['X1']
+    conv_flat = fp_data['conv_flat']
+
+    print("Shape of P:", P.shape)
+    print("Shape of Y:", Y.shape)
+
+    # ---- Output layer ----
+    G = (P - Y) / n
+
+    grad_W2 = G @ X1.T + 2 * lam * net_params['W'][1]
+    grad_b2 = np.sum(G, axis=1, keepdims=True)
+
+    # ---- Backprop to hidden layer ----
+    G_hidden = net_params['W'][1].T @ G
+    G_hidden *= (X1 > 0)   # ReLU derivative
+
+    grad_W1 = G_hidden @ conv_flat.T + 2 * lam * net_params['W'][0]
+    grad_b1 = np.sum(G_hidden, axis=1, keepdims=True)
+
+    # ---- Backprop to conv_flat ----
+    G_batch = net_params['W'][0].T @ G_hidden
+
+    # ReLU derivative for conv layer
+    G_batch *= (conv_flat > 0)
+
+    # ---- Reshape back to (n_p, nf, n) ----
+    # Forward did: (n_p, nf, n) → (nf, n_p, n) → (nf*n_p, n)
+    # So reverse it:
+
+    GG = G_batch.reshape((nf, n_p, n), order='C')
+    GG = np.transpose(GG, (1, 0, 2))   # (n_p, nf, n)
+
+    # ---- Compute gradient for filters ----
+    # MX: (n_p, d, n)
+    # GG: (n_p, nf, n)
+
+    grad_Fs_flat = np.zeros((MX.shape[1], nf))
+
+    for i in range(n):
+        grad_Fs_flat += MX[:, :, i].T @ GG[:, :, i]
+    grad_Fs_flat /= n
+
+    # ---- Package gradients ----
+    grads = {
+        'W': [grad_W1, grad_W2],
+        'b': [grad_b1, grad_b2],
+        'Fs_flat': grad_Fs_flat
+    }
+
+    return grads
 def DataSplit(X, Y, y, sample_size):
     X_all = []
     Y_all = []
@@ -252,6 +284,23 @@ def PreComputeMX(TrainX, TestX, ValX, Fs):
     
     return MX_TrainX, MX_TestX, MX_ValX
 
+def CyclicLearningRate(eta_min, eta_max, t, initial_n_s):
+    # Implementation for cyclic learning rate
+
+    current_n_s = initial_n_s
+    t_remaining = t
+    while t_remaining >= 2 * current_n_s:
+        t_remaining -= 2 * current_n_s
+        current_n_s *= 2
+    
+    l = t // (2 * current_n_s)
+
+    if t <= (2*l +1) * current_n_s and t >= 2 * l * current_n_s:
+        eta_t = eta_min + (t - 2 * l * current_n_s ) / current_n_s * (eta_max - eta_min)
+    else:
+        eta_t = eta_max - (t - (2 * l + 1) * current_n_s ) / current_n_s * (eta_max - eta_min)
+    return eta_t
+
 def TrainNetwork(MX_Train, TrainY, init_net, net_params):
 
     trained_net = copy.deepcopy(init_net)
@@ -280,41 +329,91 @@ def TrainNetwork(MX_Train, TrainY, init_net, net_params):
             trained_net['Fs'] -= eta * grads['Fs_flat']
             trained_net['bf'] -= eta * grads['bf_flat']
 
+def MiniBatchGD(X, Y, y_labels, ValX, ValY, val_y_labels, GDperms, init_net, lam, rng):
+    trained_net = copy.deepcopy(init_net)
+    n = X.shape[1]
+    n_batch, n_epochs, eta_min, eta_max, n_s = GDperms['n_batch'], GDperms['n_epochs'], GDperms['eta_min'], GDperms['eta_max'], GDperms['n_s']
+
+    t = 0
+
+    train_loss = []
+    test_loss = []
+    acc_train = []
+    acc_test = []
+    update_steps = []
+
+    for epoch in range(n_epochs):
+        indices = rng.permutation(n)  
+        for j in range(n // n_batch):
+            t += 1
+            eta = CyclicLearningRate(eta_min, eta_max, t, n_s)
+            j_start, j_end = j * n_batch, (j + 1) * n_batch
+            inds = indices[j_start:j_end]
+            X_batch, Y_batch = X[:, inds], Y[:, inds]
+            
+            # Forward & Backward
+            P_batch, fp_batch = ForwardPass(X_batch, trained_net)
+            grads = BackwardPass(X_batch, Y_batch, P_batch, fp_batch, trained_net, lam)
+            
+            # Update weights
+            for i in range(len(trained_net['W'])):
+                trained_net['W'][i] -= eta * grads['W'][i]
+                trained_net['b'][i] -= eta * grads['b'][i]
+            trained_net['Fs'] -= eta * grads['Fs_flat']
+            trained_net['bf'] -= eta * grads['bf_flat']
+    
+        P_train, _ = ForwardPass(X, trained_net['Fs'], net_params)
+        P_test, _ = ForwardPass(ValX, trained_net['Fs'], net_params)
+        
+        tr_loss = ComputeCrossEntropyLoss(P_train, y_labels)
+        ts_loss = ComputeCrossEntropyLoss(P_test, val_y_labels)
+        
+        tr_acc = float(ComputeAccuracy(P_train, y_labels).split()[0]) / 100
+        ts_acc = float(ComputeAccuracy(P_test, val_y_labels).split()[0]) / 100
+
+        train_loss.append(tr_loss)
+        test_loss.append(ts_loss)
+        acc_train.append(tr_acc)
+        acc_test.append(ts_acc)
+        update_steps.append(t) 
+    
+    return trained_net, train_loss, test_loss, acc_train, acc_test, update_steps
 
 data = LoadBatch('data_batch_1')
 X, Y, y = data
 
 f = 4
-nf = 3
-n = X.shape[3] 
+nf = 2
+nh = 50
+n = X.shape[0] 
 n_p = (X.shape[2]//f) * (X.shape[3]//f)
 d = n_p * nf
 K = Y.shape[0]
 L = 2
+m = nh
 
-net_params= InitializeParameters(L, d, K, d, nf, f, np.random.default_rng(seed=0))
+rng = np.random.default_rng()
+BitGen = type(rng.bit_generator)
+seed = 42
+rng.bit_generator.state = BitGen(seed).state
+
+net_params = InitializeParameters(L, m, K, d, nf, f, rng)
 W = net_params['W']
 b = net_params['b']
 Fs = net_params['Fs']   
+print("Fs shape:", Fs.shape)
 
 TestX, TestY, Testy, TrainX, TrainY, Trainy, ValX, ValY, Valy = DataSplit(X, Y, y, sample_size=10)
-#print(Trainy - np.argmax(TrainY, axis=0))
-#print("TrainY shape:", TrainY.shape)
 
 MX_TrainX, MX_TestX, MX_ValX = PreComputeMX(TrainX, TestX, ValX, Fs)
 fp_data = ForwardPass(MX_TrainX, Fs, net_params)
 my_grads = BackwardPass(MX_TrainX, TrainY, net_params, fp_data, lam=0.0)
-torch_grads = ComputeGradsWithTorch(TrainX, TrainY, MX_TrainX, Fs, net_params, fp_data['conv_flat'])
-
+torch_grads = ComputeGradsWithTorch(TrainX, Trainy, MX_TrainX, Fs, net_params, fp_data['conv_flat'])
 
 eps = 1e-10
-
-print("My Grads first 5 Fs values: ", my_grads['Fs_flat'][:5])
-print("Torch Grads first 5 Fs values: ", torch_grads['Fs_flat'][:5])
-
-
 diff_Fs = np.abs(my_grads['Fs_flat'] - torch_grads['Fs_flat'])
-print("Difference in Fs gradients (first 5 values): ", diff_Fs[:5])
+#print("Difference in Fs gradients (first 5 values): ", diff_Fs[:5])
+#print(net_params['Fs'].shape[3])
 
 diff_W1 = np.abs(my_grads['W'][0] - torch_grads['W'][0]) / max(eps, np.sum(np.sum(np.abs(my_grads['W'][0]) + np.abs(torch_grads['W'][0]), axis=0), axis=0))
 diff_b1 = np.abs(my_grads['b'][0] - torch_grads['b'][0])/ max(eps, np.sum(np.abs(my_grads['b'][0]) + np.abs(torch_grads['b'][0])))
@@ -323,12 +422,64 @@ diff_Fs = np.abs(my_grads['Fs_flat'] - torch_grads['Fs_flat']) / max(eps, np.sum
 diff_W2 = np.abs(my_grads['W'][1] - torch_grads['W'][1]) / max(eps, np.sum(np.sum(np.abs(my_grads['W'][1]) + np.abs(torch_grads['W'][1]), axis=0), axis=0)) 
 diff_b2 = np.abs(my_grads['b'][1] - torch_grads['b'][1])/ max(eps, np.sum(np.abs(my_grads['b'][1]) + np.abs(torch_grads['b'][1])))
 
-#print("Relative difference in W1: ", max(diff_W1))
-#print("Relative difference in b1: ", diff_b1)
-print("Relative difference in Fs: ", diff_Fs)
-#print("Relative difference in W2: ", diff_W2)
-#print("Relative difference in b2: ", diff_b2)
+print("Relative difference in W1: ", np.max(diff_W1))
+print("Relative difference in b1: ", np.max(diff_b1))
+print("Relative difference in Fs: ", np.max(diff_Fs))
+print("Relative difference in W2: ", np.max(diff_W2))
+print("Relative difference in b2: ", np.max(diff_b2))
+'''
+lam = 0.003
+eta_min = 1e-5
+eta_max = 1e-1
+n_batch = 100
+n_cycles = 3 
+step = 800 
+n = TrainX.shape[1]
+n_s = 4 * np.floor(n / n_batch)
+GDperms = {'n_batch': n_batch, 'n_epochs': 24, 'eta_min' : eta_min, 'eta_max': eta_max, 'n_s': n_s}
 
+
+
+
+init_net = copy.deepcopy(net_params)
+
+final_net, train_loss, test_loss, acc_train, acc_test, steps = MiniBatchGD(TrainX, TrainY, Trainy, ValX, ValY, Valy, GDperms, init_net, lam, rng)    
+
+P_test, _ = ForwardPass(TestX, final_net, net_params)
+test_acc = ComputeAccuracy(P_test, Testy)
+print(f"--- FINAL TEST ACCURACY: {test_acc} ---")
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+
+ax1.plot(steps, train_loss, 'g-', label='Training loss')
+ax1.plot(steps, test_loss, 'r-', label='Testing loss')
+ax1.set_ylim(0, max(max(train_loss), max(test_loss)) * 1.1)
+ax1.set_title('Cost Function')
+ax1.set_xlabel('Update step')
+ax1.set_ylabel('Cost')
+ax1.legend()
+
+ax2.plot(steps,acc_train, 'g-', label='Training accuracy')
+ax2.plot(steps, acc_test, 'r-', label='Testing accuracy')
+ax2.set_ylim(0, max(max(acc_train), max(acc_test)) * 1.1)
+ax2.set_title('Accuracy')
+ax2.set_xlabel('Update step')
+ax2.set_ylabel('Accuracy')
+ax2.legend()
+
+plt.tight_layout()
+plt.show()
+
+
+
+'''
+"""
+print("My Grads first 5 Fs values: ", my_grads['Fs_flat'][:5])
+print("Torch Grads first 5 Fs values: ", torch_grads['Fs_flat'][:5])
+
+
+
+"""
 
 """
 MX_TrainX, MX_TestX = PreComputeMX(TrainX, TestX)
